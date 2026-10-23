@@ -30,8 +30,62 @@ from agent import CheckInAgent
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("APP_PORT", "8001"))
 MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+USE_INPROCESS_MCP = os.getenv("USE_INPROCESS_MCP", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# A single agent per process. Vercel may not run ASGI lifespan events, so the
+# endpoints also initialize lazily on the first request.
+_agent: Optional[CheckInAgent] = None
+_agent_lock: Optional[asyncio.Lock] = None
+_agent_init_lock: Optional[asyncio.Lock] = None
+
+
+def _agent_lock_for_request() -> asyncio.Lock:
+    global _agent_lock
+    if _agent_lock is None:
+        _agent_lock = asyncio.Lock()
+    return _agent_lock
+
+
+def _agent_init_lock_for_request() -> asyncio.Lock:
+    global _agent_init_lock
+    if _agent_init_lock is None:
+        _agent_init_lock = asyncio.Lock()
+    return _agent_init_lock
+
+
+def _new_agent() -> CheckInAgent:
+    if USE_INPROCESS_MCP:
+        from mcp_server import server as mcp_server_instance
+
+        agent = CheckInAgent(mcp_server=mcp_server_instance)
+        print("[web] using the in-process MCP server")
+    else:
+        agent = CheckInAgent(MCP_URL)
+        print(f"[web] using the MCP server at {MCP_URL}")
+    return agent
+
+
+async def _ensure_agent() -> CheckInAgent:
+    global _agent
+    if _agent is not None:
+        return _agent
+
+    async with _agent_init_lock_for_request():
+        if _agent is None:
+            agent = _new_agent()
+            print(f"[web] agent mode: {agent.mode}")
+            try:
+                await agent.connect()
+            except Exception as exc:  # the server may not be up yet
+                print(f"[web] could not connect to the MCP server at startup: {exc}")
+            _agent = agent
+    return _agent
 
 DISCLAIMER = (
     "Check-in Relay is a wellbeing reminder, not a medical service, and it is "
@@ -52,23 +106,28 @@ class ResolveRequest(BaseModel):
     resolved_by: str = Field(default="family", max_length=120)
 
 
+class ScheduleRequest(BaseModel):
+    """A short schedule set from the dashboard demo controls."""
+
+    person: str = Field(min_length=1, max_length=120)
+    interval_seconds: int = Field(default=60, gt=0, le=7 * 24 * 3600)
+    grace_seconds: Optional[int] = Field(default=None, ge=0, le=600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Connect the MCP client on startup and release it on shutdown."""
-    agent = CheckInAgent(MCP_URL)
-    app.state.agent = agent
-    app.state.agent_lock = asyncio.Lock()
-    try:
-        await agent.connect()
-    except Exception as exc:  # the server may not be up yet
-        print(f"[web] could not connect to the MCP server at startup: {exc}")
+    global _agent
+    agent = await _ensure_agent()
     try:
         yield
     finally:
-        try:
-            await agent.close()
-        except Exception:
-            pass
+        if _agent is agent:
+            try:
+                await agent.close()
+            except Exception:
+                pass
+            _agent = None
 
 
 app = FastAPI(
@@ -84,17 +143,20 @@ if STATIC_DIR.exists():
 
 async def _call(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Call an MCP tool, turning failures into a clean 503 for the browser."""
-    agent: CheckInAgent = app.state.agent
+    agent = await _ensure_agent()
     try:
-        async with app.state.agent_lock:
+        async with _agent_lock_for_request():
             return await agent.call_tool(tool, arguments)
     except Exception as exc:
+        target = (
+            "the in-process MCP server"
+            if USE_INPROCESS_MCP
+            else f"the Check-in Relay MCP server at {MCP_URL}. "
+            "Start it with 'python mcp_server.py' and try again."
+        )
         raise HTTPException(
             status_code=503,
-            detail=(
-                f"Could not reach the Check-in Relay MCP server at {MCP_URL}. "
-                f"Start it with 'python mcp_server.py' and try again. ({exc})"
-            ),
+            detail=f"Could not reach {target} ({exc})",
         ) from exc
 
 
@@ -110,15 +172,16 @@ async def index() -> FileResponse:
 @app.get("/api/health")
 async def health() -> JSONResponse:
     """Liveness for the web app plus the state of the MCP link."""
-    agent: CheckInAgent = app.state.agent
+    agent = await _ensure_agent()
     body: dict[str, Any] = {
         "status": "ok",
         "app": "check-in-relay-web",
-        "mcp_url": MCP_URL,
+        "mcp_url": "in-process" if USE_INPROCESS_MCP else MCP_URL,
         "disclaimer": DISCLAIMER,
+        "agent_mode": agent.mode,
     }
     try:
-        async with app.state.agent_lock:
+        async with _agent_lock_for_request():
             body["protocol_version"] = agent.protocol_version
             body["tools"] = await agent.list_tools()
             body["mcp_status"] = "connected"
@@ -154,21 +217,24 @@ async def people() -> JSONResponse:
 @app.post("/api/checkin")
 async def checkin(request: CheckinRequest) -> JSONResponse:
     """Turn a spoken phrase into MCP tool calls and return the reply."""
-    agent: CheckInAgent = app.state.agent
+    agent = await _ensure_agent()
     try:
-        async with app.state.agent_lock:
+        async with _agent_lock_for_request():
             result = await agent.handle(
                 request.text, speaker=request.speaker, source=request.source
             )
     except HTTPException:
         raise
     except Exception as exc:
+        target = (
+            "the in-process MCP server"
+            if USE_INPROCESS_MCP
+            else f"the Check-in Relay MCP server at {MCP_URL}. "
+            "Start it with 'python mcp_server.py' and try again."
+        )
         raise HTTPException(
             status_code=503,
-            detail=(
-                f"Could not reach the Check-in Relay MCP server at {MCP_URL}. "
-                f"Start it with 'python mcp_server.py' and try again. ({exc})"
-            ),
+            detail=f"Could not reach {target} ({exc})",
         ) from exc
 
     return JSONResponse(result.to_dict())
@@ -178,6 +244,24 @@ async def checkin(request: CheckinRequest) -> JSONResponse:
 async def resolve_alert(alert_id: int, request: ResolveRequest) -> JSONResponse:
     """Close an alert from the dashboard, through MCP."""
     data = await _call("resolve_alert", {"alert_id": alert_id, "resolved_by": request.resolved_by})
+    return JSONResponse(data)
+
+
+@app.post("/api/schedule")
+async def schedule(request: ScheduleRequest) -> JSONResponse:
+    """Set a short check-in interval for the demo, through MCP.
+
+    The dashboard controls speak in seconds so the escalation story can be
+    reproduced in under a minute; the MCP tool takes fractional minutes.
+    """
+    data = await _call(
+        "schedule_checkin",
+        {
+            "person": request.person,
+            "interval_minutes": request.interval_seconds / 60,
+            "grace_seconds": request.grace_seconds,
+        },
+    )
     return JSONResponse(data)
 
 
